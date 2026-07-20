@@ -132,6 +132,14 @@ body{
 
 .scan-ctrls{display:flex; flex-wrap:wrap; gap:8px; margin-top:12px; align-items:center}
 .scan-ctrls select{flex:1 1 140px; min-width:0}
+.camera-status{margin-top:8px;display:flex;align-items:flex-start;gap:7px;color:var(--muted);font-size:12px;line-height:1.35}
+.camera-status .dot{width:8px;height:8px;border-radius:50%;background:var(--faint);margin-top:4px;flex:none;box-shadow:0 0 0 3px rgba(148,163,184,.15)}
+.camera-status.active .dot{background:var(--ok);box-shadow:0 0 0 3px rgba(22,163,74,.14)}
+.camera-status.warn .dot{background:var(--gold);box-shadow:0 0 0 3px rgba(212,168,67,.16)}
+.zoom-wrap{display:flex;align-items:center;gap:7px;flex:1 1 180px;min-width:160px;padding:6px 9px;border:1px solid var(--line);border-radius:8px;background:#fff}
+.zoom-wrap label{font-size:11px;color:var(--muted);white-space:nowrap}
+.zoom-wrap input{width:100%;accent-color:var(--navy)}
+.zoom-wrap output{font-family:var(--mono);font-size:11px;min-width:30px;text-align:right;color:var(--navy)}
 
 /* ---------- result card ---------- */
 .result{
@@ -344,7 +352,13 @@ details.help ul li{margin:4px 0}
         <button class="btn gold" id="btnScan">▶ Iniciar escáner</button>
         <select id="camSelect" class="hide" aria-label="Cámara"></select>
         <button class="btn ghost sm hide" id="btnTorch">🔦 Luz</button>
+        <div class="zoom-wrap hide" id="zoomWrap">
+          <label for="zoomRange">Zoom</label>
+          <input type="range" id="zoomRange" min="1" max="1" step="0.1" value="1" aria-label="Zoom de cámara">
+          <output id="zoomValue">1×</output>
+        </div>
       </div>
+      <div class="camera-status" id="cameraStatus"><span class="dot"></span><span>Usa la cámara trasera. Mantén el código horizontal, a unos 10–20 cm, hasta que ocupe casi todo el recuadro y evita reflejos.</span></div>
       <div class="manual">
         <input type="text" id="manualCode" inputmode="text" autocomplete="off" autocapitalize="characters" spellcheck="false" enterkeyhint="done" placeholder="…o escribe/pega un Cód. Barras">
         <button class="btn primary" id="btnManual">Registrar</button>
@@ -448,7 +462,7 @@ var o=[];var l=Array.isArray(e);for(f=n.s.c;f<=n.e.c;++f)s[f]=ya(f);for(var c=n.
 <script>
 "use strict";
 /* ============================================================
-   Inventario de Biblioteca · UDALBA · v3
+   Inventario de Biblioteca · UDALBA · v3.1
    Modelo correcto:
    - N° R. Aleph (BIB) = registro bibliográfico / título único.
    - Cód. Barras = ejemplar físico único.
@@ -482,6 +496,21 @@ function normalizeAleph(raw){
   let s = String(raw==null?'':raw).trim();
   if(/^\d+\.0+$/.test(s)) s=s.replace(/\.0+$/,'');
   return s.toUpperCase();
+}
+function resolveScannedBarcode(raw){
+  const code=normalizeBarcode(raw);
+  if(!code||!barcodeIndex.size||barcodeIndex.has(code)) return code;
+  const candidates=[];
+  // Algunos lectores Codabar devuelven las letras de inicio/fin A, B, C o D.
+  if(/^[ABCD].+[ABCD]$/.test(code)&&code.length>2) candidates.push(code.slice(1,-1));
+  // Algunos equipos informan UPC-A como EAN-13 agregando un cero inicial (o al revés).
+  if(/^0\d{12}$/.test(code)) candidates.push(code.slice(1));
+  if(/^\d{12}$/.test(code)) candidates.push('0'+code);
+  // Variación frecuente entre Excel y lectores: ceros iniciales no significativos.
+  const noZeros=code.replace(/^0+/,'')||'0';
+  if(noZeros!==code) candidates.push(noZeros);
+  for(const candidate of candidates){ if(barcodeIndex.has(candidate)) return candidate; }
+  return code;
 }
 function stripKey(h){
   return String(h==null?'':h).toLowerCase()
@@ -761,7 +790,7 @@ const CAMERA_REPEAT_WINDOW=1600;
 function countCode(raw,opts){
   opts=opts||{};
   if(!base.size){ showBanner('warn','Carga primero la base de existencias para comenzar el inventario.',5000); return; }
-  const code=normalizeBarcode(raw);
+  const code=resolveScannedBarcode(raw);
   if(!code) return;
   const now=Date.now();
   if(!opts.manual && code===lastSeenCode && now-lastSeenTime<CAMERA_REPEAT_WINDOW){ lastSeenTime=now; return; }
@@ -972,27 +1001,116 @@ function renderAll(){ renderKpis(); renderResult(); renderTable(); }
 
 /* ---------- escáner ---------- */
 let codeReader=null, scanning=false, resumeCam=false;
+let nativeDetector=null, nativeTimer=null, scanSession=0;
+let lastCameraRead={code:'',at:0};
+
+function zxingFormats(){
+  const names=['CODABAR','CODE_39','CODE_93','CODE_128','EAN_8','EAN_13','ITF','UPC_A','UPC_E','RSS_14','RSS_EXPANDED','QR_CODE','DATA_MATRIX','PDF_417'];
+  return names.map(n=>ZXing.BarcodeFormat[n]).filter(v=>v!==undefined&&v!==null);
+}
 function makeReader(){
   const hints=new Map();
-  hints.set(ZXing.DecodeHintType.POSSIBLE_FORMATS,[ZXing.BarcodeFormat.EAN_13,ZXing.BarcodeFormat.EAN_8,ZXing.BarcodeFormat.UPC_A,ZXing.BarcodeFormat.UPC_E,ZXing.BarcodeFormat.CODE_128,ZXing.BarcodeFormat.CODE_39,ZXing.BarcodeFormat.ITF,ZXing.BarcodeFormat.QR_CODE,ZXing.BarcodeFormat.DATA_MATRIX]);
+  hints.set(ZXing.DecodeHintType.POSSIBLE_FORMATS,zxingFormats());
   hints.set(ZXing.DecodeHintType.TRY_HARDER,true);
-  return new ZXing.BrowserMultiFormatReader(hints,250);
+  return new ZXing.BrowserMultiFormatReader(hints,120);
+}
+function setCameraStatus(message,type=''){
+  const el=$('cameraStatus');
+  if(!el) return;
+  el.className='camera-status'+(type?' '+type:'');
+  const span=el.querySelector('span:last-child');
+  if(span) span.textContent=message;
+}
+function handleCameraRead(raw,source='cámara'){
+  const code=String(raw??'').trim();
+  if(!code) return;
+  const now=Date.now();
+  if(lastCameraRead.code===code && now-lastCameraRead.at<1800) return;
+  lastCameraRead={code,at:now};
+  countCode(code,{camera:true,source});
 }
 let wakeLock=null;
 async function reqWakeLock(){ try{ if('wakeLock' in navigator){ wakeLock=await navigator.wakeLock.request('screen'); wakeLock.addEventListener('release',()=>{wakeLock=null;}); } }catch(e){} }
 function relWakeLock(){ try{ if(wakeLock) wakeLock.release(); }catch(e){} wakeLock=null; }
+
+async function applyBestCameraSettings(track){
+  if(!track||!track.getCapabilities) return;
+  const caps=track.getCapabilities()||{};
+  const attempts=[];
+  if(Array.isArray(caps.focusMode)&&caps.focusMode.includes('continuous')) attempts.push({focusMode:'continuous'});
+  if(Array.isArray(caps.exposureMode)&&caps.exposureMode.includes('continuous')) attempts.push({exposureMode:'continuous'});
+  if(Array.isArray(caps.whiteBalanceMode)&&caps.whiteBalanceMode.includes('continuous')) attempts.push({whiteBalanceMode:'continuous'});
+  for(const advanced of attempts){ try{await track.applyConstraints({advanced:[advanced]});}catch(e){} }
+  setupZoom(track,caps);
+}
+function setupZoom(track,caps){
+  const wrap=$('zoomWrap'),range=$('zoomRange'),out=$('zoomValue');
+  if(!wrap||!range||!out){return;}
+  if(caps&&caps.zoom&&Number.isFinite(caps.zoom.min)&&Number.isFinite(caps.zoom.max)&&caps.zoom.max>caps.zoom.min){
+    const settings=track.getSettings?track.getSettings():{};
+    const min=Number(caps.zoom.min),max=Number(caps.zoom.max),step=Number(caps.zoom.step||0.1),value=Math.min(max,Math.max(min,Number(settings.zoom||min)));
+    range.min=String(min);range.max=String(max);range.step=String(step);range.value=String(value);out.value=`${value.toFixed(value%1?1:0)}×`;wrap.classList.remove('hide');
+    range.oninput=async()=>{const z=Number(range.value);out.value=`${z.toFixed(z%1?1:0)}×`;try{await track.applyConstraints({advanced:[{zoom:z}]});}catch(e){}};
+  }else wrap.classList.add('hide');
+}
+async function startNativeDetector(session){
+  if(!('BarcodeDetector' in window)) return false;
+  try{
+    const wanted=['codabar','code_39','code_93','code_128','ean_8','ean_13','itf','upc_a','upc_e','qr_code','data_matrix','pdf417'];
+    const supported=BarcodeDetector.getSupportedFormats?await BarcodeDetector.getSupportedFormats():wanted;
+    const formats=wanted.filter(f=>supported.includes(f));
+    if(!formats.length) return false;
+    nativeDetector=new BarcodeDetector({formats});
+    const video=$('video');
+    const loop=async()=>{
+      if(!scanning||session!==scanSession) return;
+      try{
+        if(video.readyState>=2&&!video.paused){
+          const found=await nativeDetector.detect(video);
+          if(found&&found.length){
+            const best=found.find(x=>x.rawValue)||found[0];
+            if(best&&best.rawValue) handleCameraRead(best.rawValue,'lector nativo');
+          }
+        }
+      }catch(e){}
+      nativeTimer=setTimeout(loop,110);
+    };
+    nativeTimer=setTimeout(loop,80);
+    return true;
+  }catch(e){ nativeDetector=null; return false; }
+}
 async function startScan(deviceId){
   if(!base.size){ showBanner('warn','Carga primero la base de existencias.',5000); return; }
   if(!window.isSecureContext && location.hostname!=='localhost'){ $('httpsBanner').classList.remove('hide'); $('httpsBanner').scrollIntoView({behavior:'smooth'}); return; }
   if(typeof ZXing==='undefined'){ showBanner('err','El módulo de escaneo no cargó. Usa el ingreso manual o un lector externo.'); return; }
   if(!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia){ showBanner('err','Este navegador no permite usar la cámara. Usa el ingreso manual o un lector externo.'); return; }
+  const session=++scanSession;
   try{
-    stopScan(true); codeReader=codeReader||makeReader();
-    const constraints=deviceId?{video:{deviceId:{exact:deviceId},width:{ideal:1280},height:{ideal:720}}}:{video:{facingMode:{ideal:'environment'},width:{ideal:1280},height:{ideal:720}}};
-    await codeReader.decodeFromConstraints(constraints,$('video'),result=>{ if(result) countCode(result.getText()); });
-    scanning=true; $('vpIdle').classList.add('hide'); $('reticle').classList.remove('hide'); $('btnScan').textContent='■ Detener'; $('btnScan').classList.remove('gold'); $('btnScan').classList.add('primary'); reqWakeLock();
-    const stream=$('video').srcObject,track=stream&&stream.getVideoTracks&&stream.getVideoTracks()[0];
-    if(track) track.addEventListener('ended',()=>{ if(scanning){ stopScan(); showBanner('warn','La cámara se detuvo. Toca «Iniciar escáner» para retomarla.'); } },{once:true});
+    stopScan(true);
+    scanSession=session;
+    codeReader=makeReader();
+    setCameraStatus('Abriendo cámara y ajustando enfoque…','warn');
+    const video={
+      width:{ideal:1920,min:640},height:{ideal:1080,min:480},
+      frameRate:{ideal:30,max:60},aspectRatio:{ideal:1.7777778}
+    };
+    if(deviceId) video.deviceId={exact:deviceId}; else video.facingMode={ideal:'environment'};
+    const constraints={audio:false,video};
+    await codeReader.decodeFromConstraints(constraints,$('video'),(result,error)=>{
+      if(result&&result.getText) handleCameraRead(result.getText(),'ZXing');
+    });
+    if(session!==scanSession) return;
+    scanning=true;
+    const videoEl=$('video');
+    try{await videoEl.play();}catch(e){}
+    $('vpIdle').classList.add('hide'); $('reticle').classList.remove('hide'); $('btnScan').textContent='■ Detener'; $('btnScan').classList.remove('gold'); $('btnScan').classList.add('primary'); reqWakeLock();
+    const stream=videoEl.srcObject,track=stream&&stream.getVideoTracks&&stream.getVideoTracks()[0];
+    if(track){
+      track.addEventListener('ended',()=>{ if(scanning&&session===scanSession){ stopScan(); showBanner('warn','La cámara se detuvo. Toca «Iniciar escáner» para retomarla.'); } },{once:true});
+      await applyBestCameraSettings(track);
+    }
+    const nativeActive=await startNativeDetector(session);
+    setCameraStatus(nativeActive?'Escáner avanzado activo: lector nativo + ZXing. Compatible con Codabar, Code 39, Code 93 y Code 128.':'Escáner ZXing activo. Compatible con Codabar, Code 39, Code 93 y Code 128.','active');
     await populateCameras(); setupTorch();
   }catch(err){
     console.error(err); stopScan(); let msg='No se pudo acceder a la cámara.';
@@ -1000,13 +1118,21 @@ async function startScan(deviceId){
     else if(err&&(err.name==='NotFoundError'||err.name==='OverconstrainedError')) msg='No se encontró una cámara compatible.';
     else if(err&&err.name==='NotReadableError') msg='Otra aplicación está usando la cámara.';
     else if(!window.isSecureContext) msg='La cámara requiere HTTPS.';
-    showBanner('err',msg);
+    setCameraStatus(msg,'warn'); showBanner('err',msg);
   }
 }
 function stopScan(silent){
-  if(codeReader){ try{codeReader.reset();}catch(e){} }
+  scanSession++;
+  if(nativeTimer){clearTimeout(nativeTimer);nativeTimer=null;}
+  nativeDetector=null;
+  if(codeReader){ try{codeReader.reset();}catch(e){} codeReader=null; }
+  const video=$('video');
+  const stream=video&&video.srcObject;
+  if(stream&&stream.getTracks) stream.getTracks().forEach(t=>{try{t.stop();}catch(e){}});
+  if(video) video.srcObject=null;
   scanning=false; relWakeLock();
-  if(!silent){ $('reticle').classList.add('hide'); $('vpIdle').classList.remove('hide'); $('btnScan').textContent='▶ Iniciar escáner'; $('btnScan').classList.add('gold'); $('btnScan').classList.remove('primary'); $('btnTorch').classList.add('hide'); }
+  $('zoomWrap').classList.add('hide');
+  if(!silent){ $('reticle').classList.add('hide'); $('vpIdle').classList.remove('hide'); $('btnScan').textContent='▶ Iniciar escáner'; $('btnScan').classList.add('gold'); $('btnScan').classList.remove('primary'); $('btnTorch').classList.add('hide'); setCameraStatus('Cámara detenida. Usa la cámara trasera y mantén el código horizontal, bien iluminado y sin reflejos.'); }
 }
 async function populateCameras(){
   try{
@@ -1015,7 +1141,7 @@ async function populateCameras(){
     const sel=$('camSelect');
     if(devices.length>1){
       sel.innerHTML=devices.map((d,i)=>`<option value="${d.deviceId}">${escapeHtml(d.label||('Cámara '+(i+1)))}</option>`).join('');
-      const back=devices.find(d=>/back|rear|tras|environment/i.test(d.label));
+      const back=devices.find(d=>/back|rear|tras|environment|wide|principal/i.test(d.label));
       const stream=$('video').srcObject,activeId=stream&&stream.getVideoTracks()[0]&&stream.getVideoTracks()[0].getSettings().deviceId;
       sel.value=activeId||(back?back.deviceId:devices[devices.length-1].deviceId); sel.classList.remove('hide');
     }else sel.classList.add('hide');
@@ -1029,7 +1155,7 @@ function setupTorch(){
   }catch(e){$('btnTorch').classList.add('hide');}
 }
 document.addEventListener('visibilitychange',()=>{
-  if(document.hidden){ if(scanning){resumeCam=true;stopScan();} relWakeLock(); saveNow(); }
+  if(document.hidden){ if(scanning){resumeCam=true;stopScan(true);} relWakeLock(); saveNow(); }
   else if(resumeCam){resumeCam=false;startScan($('camSelect').value||null);}
 });
 
